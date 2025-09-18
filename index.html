@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hash Garden</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Custom Font: Inter (minimal, modern) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+      html { font-family: 'Inter', sans-serif; }
+    </style>
+  </head>
+  <body>
+
+    <div class="min-h-screen bg-zinc-950 text-white flex flex-col justify-between">
+      <main class="flex-1 w-full max-w-2xl mx-auto px-4 py-8">
+        <header class="text-center mb-10 border-b border-zinc-800 pb-6">
+          <h1 class="text-3xl font-semibold text-purple-400 tracking-tight mb-2">Hash Garden</h1>
+          <p class="text-zinc-400 text-base">Browse your files stored on Blossom servers</p>
+        </header>
+
+        <section class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mb-6">
+          <h2 class="flex items-center gap-2 text-purple-400 text-lg font-semibold mb-4">
+            1. Login
+            <span id="authStatus" class="inline-block w-3 h-3 rounded-full ml-2"></span>
+          </h2>
+          <button id="connectBtn" onclick="connectWallet()" class="bg-purple-500 hover:bg-purple-600 transition px-5 py-2 rounded-lg text-white font-medium disabled:bg-zinc-700 disabled:cursor-not-allowed">
+            Login with Browser Extension
+          </button>
+          <div id="authInfo" style="display: none">
+            <div class="bg-blue-900 border border-blue-500 text-blue-200 px-3 py-2 rounded mt-4 text-sm">Logged in as: <span id="pubkeyDisplay"></span></div>
+          </div>
+        </section>
+
+        <section class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mb-6" id="connectionSection" style="display: none">
+          <h2 class="flex items-center gap-2 text-purple-400 text-lg font-semibold mb-4">
+            Connecting
+            <span id="connectionStatus" class="inline-block w-3 h-3 rounded-full ml-2"></span>
+          </h2>
+          <div id="connectionInfo"></div>
+        </section>
+
+        <section class="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+          <h2 class="flex items-center gap-2 text-purple-400 text-lg font-semibold mb-4">
+            2. Browse Files
+            <span id="filesStatus" class="inline-block w-3 h-3 rounded-full ml-2"></span>
+          </h2>
+          <div id="filesSection" style="display: none">
+            <div id="filesInfo"></div>
+            <div id="filesGrid" class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4"></div>
+            <div id="pagination" class="flex justify-center items-center gap-2 mt-4"></div>
+          </div>
+        </section>
+      </main>
+      <footer class="w-full text-center py-4 text-zinc-500 text-sm">
+        Made with <span class="text-purple-400">💜</span> by
+        <a href="https://unsigned.in/" target="_blank" rel="noopener" class="underline hover:text-purple-400 transition">Team Unsigned</a>
+      </footer>
+    </div>
+
+    <script>
+      let userPubkey = null;
+      let outboxRelays = [];
+      let blossomServers = [];
+      let selectedServer = null;
+      let allFiles = [];
+      let currentPage = 1;
+      let filesPerPage = 25;
+
+      function updateStatus(elementId, status) {
+        const element = document.getElementById(elementId);
+        // Tailwind status color
+        element.className = `inline-block w-3 h-3 rounded-full ml-2 ${
+          status === 'loading' ? 'bg-amber-400 animate-pulse' :
+          status === 'success' ? 'bg-green-400' :
+          status === 'error' ? 'bg-red-500' : ''
+        }`;
+      }
+
+      function showInfo(elementId, message, type = "info") {
+        const element = document.getElementById(elementId);
+        if (type === "info") {
+          element.innerHTML = `<div class='bg-blue-900 border border-blue-500 text-blue-200 px-3 py-2 rounded mb-3 text-sm'>${message}</div>`;
+        } else if (type === "error") {
+          element.innerHTML = `<div class='bg-red-900 border border-red-600 text-red-200 px-3 py-2 rounded mb-3 text-sm'>${message}</div>`;
+        }
+      }
+
+      function logError(message, error) {
+        console.error(message, error);
+        return `${message}: ${error.message || error}`;
+      }
+
+      async function connectWallet() {
+        try {
+          updateStatus("authStatus", "loading");
+
+          let attempts = 0;
+          const maxAttempts = 10;
+          while (!window.nostr && attempts < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            attempts++;
+          }
+
+          if (!window.nostr) {
+            throw new Error(
+              "No Nostr browser extension found. Please install Alby, nos2x, or another NIP-07 extension and refresh the page."
+            );
+          }
+
+          try {
+            userPubkey = await window.nostr.getPublicKey();
+          } catch (permissionError) {
+            if (
+              permissionError.message?.includes("denied") ||
+              permissionError.message?.includes("rejected")
+            ) {
+              throw new Error(
+                "Permission denied. Please allow this site to access your Nostr extension and try again."
+              );
+            }
+            throw permissionError;
+          }
+
+          updateStatus("authStatus", "success");
+          document.getElementById("pubkeyDisplay").textContent = userPubkey;
+          document.getElementById("authInfo").style.display = "block";
+
+          // Show simplified connection step
+          document.getElementById("connectionSection").style.display = "block";
+          updateStatus("connectionStatus", "loading");
+          showInfo("connectionInfo", "Loading connected relays...", "info");
+
+          setTimeout(() => {
+            fetchOutboxRelays();
+          }, 1000);
+        } catch (error) {
+          updateStatus("authStatus", "error");
+          showInfo("authInfo", logError("Failed to login", error), "error");
+        }
+      }
+
+      async function fetchOutboxRelays() {
+        try {
+          const relayUrl = "wss://purplepag.es";
+          const ws = await connectToRelay(relayUrl);
+
+          const subscription = [
+            "REQ",
+            "outbox",
+            {
+              kinds: [10002],
+              authors: [userPubkey],
+              limit: 1,
+            },
+          ];
+
+          ws.send(JSON.stringify(subscription));
+          const result = await waitForEvent(ws, "outbox");
+          ws.close();
+
+          if (result) {
+            outboxRelays = result.tags
+              .filter((tag) => tag[0] === "r")
+              .map((tag) => tag[1]);
+
+            updateStatus("connectionStatus", "success");
+
+            const relayList = outboxRelays
+              .map((relay) => `<div class='text-zinc-400 text-xs'>• ${relay}</div>`)
+              .join("");
+
+            showInfo(
+              "connectionInfo",
+              `Connected Relays:<div class='bg-zinc-800 rounded px-2 py-1 mt-2 mb-2'>${relayList}</div>`,
+              "info"
+            );
+
+            setTimeout(() => {
+              fetchBlossomServers();
+            }, 1000);
+          } else {
+            throw new Error("No connected relays found for this pubkey");
+          }
+        } catch (error) {
+          updateStatus("connectionStatus", "error");
+          showInfo(
+            "connectionInfo",
+            logError("Failed to fetch connected relays", error),
+            "error"
+          );
+        }
+      }
+
+      async function fetchBlossomServers() {
+        try {
+          showInfo("connectionInfo", "Loading Blossom servers...", "info");
+          updateStatus("connectionStatus", "loading");
+
+          let blossomEvent = null;
+          for (const relayUrl of outboxRelays) {
+            try {
+              const ws = await connectToRelay(relayUrl);
+              const subscription = [
+                "REQ",
+                "blossom",
+                {
+                  kinds: [10063],
+                  authors: [userPubkey],
+                  limit: 1,
+                },
+              ];
+              ws.send(JSON.stringify(subscription));
+              const result = await waitForEvent(ws, "blossom", 3000);
+              ws.close();
+              if (result) {
+                blossomEvent = result;
+                break;
+              }
+            } catch (error) {
+              console.warn(`Failed to connect to ${relayUrl}:`, error);
+            }
+          }
+
+          if (blossomEvent) {
+            blossomServers = blossomEvent.tags
+              .filter((tag) => tag[0] === "server")
+              .map((tag) => tag[1]);
+
+            if (blossomServers.length > 0) {
+              selectedServer = blossomServers[0]; // auto-pick first
+              updateStatus("connectionStatus", "success");
+              showInfo(
+                "connectionInfo",
+                `Connected to Blossom server: ${selectedServer}`,
+                "info"
+              );
+              fetchFiles();
+            } else {
+              updateStatus("connectionStatus", "error");
+              showInfo(
+                "connectionInfo",
+                "No Blossom servers found in your configuration",
+                "error"
+              );
+            }
+          } else {
+            updateStatus("connectionStatus", "error");
+            showInfo(
+              "connectionInfo",
+              "No Blossom servers found in your configuration",
+              "error"
+            );
+          }
+        } catch (error) {
+          updateStatus("connectionStatus", "error");
+          showInfo(
+            "connectionInfo",
+            logError("Failed to fetch Blossom servers", error),
+            "error"
+          );
+        }
+      }
+
+      async function fetchFiles() {
+        try {
+          updateStatus("filesStatus", "loading");
+          showInfo("filesInfo", "Fetching files...", "info");
+
+          const authEvent = await createBlossomAuthEvent("list");
+          const apiUrl = `${selectedServer}/list/${userPubkey}`;
+          const response = await fetch(apiUrl, {
+            method: "GET",
+            headers: {
+              Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
+              "Content-Type": "application/json",
+            },
+            mode: "cors",
+          });
+
+          if (!response.ok) {
+            throw new Error(
+              `Server responded with ${response.status}: ${response.statusText}`
+            );
+          }
+
+          allFiles = await response.json();
+          currentPage = 1;
+
+          updateStatus("filesStatus", "success");
+          document.getElementById("filesSection").style.display = "block";
+          displayFiles();
+        } catch (error) {
+          updateStatus("filesStatus", "error");
+          showInfo("filesInfo", logError("Failed to fetch files", error), "error");
+        }
+      }
+
+      async function createBlossomAuthEvent(action) {
+        const now = Math.floor(Date.now() / 1000);
+        const event = {
+          kind: 24242,
+          pubkey: userPubkey,
+          created_at: now,
+          content: "",
+          tags: [
+            ["t", action],
+            ["expiration", (now + 300).toString()],
+          ],
+        };
+        return await window.nostr.signEvent(event);
+      }
+
+      function displayFiles() {
+        const totalFiles = allFiles.length;
+        const totalPages = Math.ceil(totalFiles / filesPerPage);
+        const startIndex = (currentPage - 1) * filesPerPage;
+        const endIndex = startIndex + filesPerPage;
+        const currentFiles = allFiles.slice(startIndex, endIndex);
+
+        showInfo(
+          "filesInfo",
+          `Showing ${currentFiles.length} of ${totalFiles} files (Page ${currentPage} of ${totalPages})`,
+          "info"
+        );
+
+        const grid = document.getElementById("filesGrid");
+        grid.innerHTML = "";
+
+        currentFiles.forEach((file) => {
+          const card = document.createElement("div");
+          card.className = "bg-zinc-800 border border-zinc-700 rounded-lg p-4 cursor-pointer hover:border-purple-400 transition";
+          const size = file.size ? formatFileSize(file.size) : "Unknown size";
+          const type = file.type || "Unknown type";
+          const uploaded = file.uploaded
+            ? new Date(file.uploaded * 1000).toLocaleDateString()
+            : "Unknown date";
+          card.innerHTML = `
+            <div class='font-semibold text-white mb-2 break-words'>${file.name || "Unnamed file"}</div>
+            <div class='text-zinc-400 text-xs mb-1'>📁 Size: ${size}</div>
+            <div class='text-zinc-400 text-xs mb-1'>📄 Type: ${type}</div>
+            <div class='text-zinc-400 text-xs mb-1'>📅 Uploaded: ${uploaded}</div>
+            <div class='font-mono text-purple-400 text-xs break-all bg-zinc-900 px-2 py-1 rounded mt-2'>${file.sha256}</div>
+          `;
+          card.onclick = () => {
+            window.open(`${selectedServer}/${file.sha256}`, "_blank");
+          };
+          grid.appendChild(card);
+        });
+
+        updatePagination(totalPages);
+      }
+
+      function updatePagination(totalPages) {
+        const pagination = document.getElementById("pagination");
+        pagination.innerHTML = "";
+        if (totalPages <= 1) return;
+        const prevBtn = document.createElement("button");
+        prevBtn.textContent = "← Previous";
+        prevBtn.disabled = currentPage === 1;
+        prevBtn.className = "px-3 py-1 rounded bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:bg-zinc-900 disabled:text-zinc-500";
+        prevBtn.onclick = () => {
+          if (currentPage > 1) {
+            currentPage--;
+            displayFiles();
+          }
+        };
+        pagination.appendChild(prevBtn);
+        const pageInfo = document.createElement("div");
+        pageInfo.className = "text-zinc-400 text-xs";
+        pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
+        pagination.appendChild(pageInfo);
+        const nextBtn = document.createElement("button");
+        nextBtn.textContent = "Next →";
+        nextBtn.disabled = currentPage === totalPages;
+        nextBtn.className = "px-3 py-1 rounded bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:bg-zinc-900 disabled:text-zinc-500";
+        nextBtn.onclick = () => {
+          if (currentPage < totalPages) {
+            currentPage++;
+            displayFiles();
+          }
+        };
+        pagination.appendChild(nextBtn);
+      }
+
+      function connectToRelay(url) {
+        return new Promise((resolve, reject) => {
+          const ws = new WebSocket(url);
+          const timeout = setTimeout(() => {
+            ws.close();
+            reject(new Error(`Connection timeout to ${url}`));
+          }, 5000);
+          ws.onopen = () => {
+            clearTimeout(timeout);
+            resolve(ws);
+          };
+          ws.onerror = () => {
+            clearTimeout(timeout);
+            reject(new Error(`Failed to connect to ${url}`));
+          };
+        });
+      }
+
+      function waitForEvent(ws, subId, timeout = 10000) {
+        return new Promise((resolve) => {
+          let result = null;
+          const timer = setTimeout(() => {
+            resolve(result);
+          }, timeout);
+          ws.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              if (data[0] === "EVENT" && data[1] === subId) {
+                result = data[2];
+              } else if (data[0] === "EOSE" && data[1] === subId) {
+                clearTimeout(timer);
+                resolve(result);
+              }
+            } catch (error) {
+              console.error("Failed to parse message:", error);
+            }
+          };
+        });
+      }
+
+      function formatFileSize(bytes) {
+        if (bytes === 0) return "0 Bytes";
+        const k = 1024,
+          sizes = ["Bytes", "KB", "MB", "GB"];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+      }
+
+      window.addEventListener("load", () => {
+        console.log("Hash Garden loaded");
+      });
+    </script>
+  </body>
+</html>
